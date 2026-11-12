@@ -481,6 +481,8 @@ final class Delegado: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var transcribiendo = false
     private var pausado = false
     private var ultimoToque = Date.distantPast
+    private var inicioPulsacion = Date()
+    private var nivelMaximo: Float = -160
     private var monitores: [Any] = []
     private var relojPermiso: Timer?
     private var ultimo: (crudo: String, texto: String)?
@@ -524,7 +526,6 @@ final class Delegado: NSObject, NSApplicationDelegate, NSWindowDelegate {
         recortarBitacora()
         anotar("arranque")
         if autoprueba {
-            prepararGrabadora()
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { self.empezar() }
             DispatchQueue.main.asyncAfter(deadline: .now() + 3.2) { self.terminar() }
             return
@@ -546,14 +547,6 @@ final class Delegado: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 self?.instalarMonitores()
                 self?.aviso.mostrar("Listo: mantén ⌘ derecho para dictar", segundos: 3)
             }
-        }
-        prepararGrabadora()
-        // Tras despertar del reposo o cambiar de micrófono, la grabadora preparada puede quedar inservible.
-        NSWorkspace.shared.notificationCenter.addObserver(
-            forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
-        ) { [weak self] _ in
-            anotar("despertó del reposo: se prepara la grabadora de nuevo")
-            self?.prepararGrabadora()
         }
     }
 
@@ -648,7 +641,12 @@ final class Delegado: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let otros = banderas & mascaraCmdIzquierdo != 0
             || !evento.modifierFlags.intersection([.shift, .control, .option]).isEmpty
         if evento.keyCode == teclaCmdDerecho {
-            if cmdDerecho, !grabando, !otros, !pausado, !transcribiendo {
+            if cmdDerecho, !otros, !pausado, !transcribiendo {
+                if grabando {
+                    // Se perdió el aviso de que soltaste la tecla la vez anterior.
+                    anotar("la grabación anterior quedó abierta: se reinicia")
+                    cancelar()
+                }
                 empezar()
             } else if !cmdDerecho, grabando {
                 terminar()
@@ -683,14 +681,21 @@ final class Delegado: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private func nivelDelMicrofono() -> Float {
         guard grabando, let grabadora = grabadora else { return -160 }
         grabadora.updateMeters()
-        return grabadora.averagePower(forChannel: 0)
+        let nivel = grabadora.averagePower(forChannel: 0)
+        nivelMaximo = max(nivelMaximo, nivel)
+        return nivel
     }
 
     private func empezar() {
-        if grabadora == nil { prepararGrabadora() }
+        // La grabadora se crea al oprimir la tecla y se suelta al terminar. Una preparada de
+        // antemano puede quedar inservible tras un rato sin uso, y así no se ocupa nada en reposo.
+        inicioPulsacion = Date()
+        nivelMaximo = -160
+        prepararGrabadora()
         guard let grabadora = grabadora, grabadora.record() else {
             anotar("no pude grabar")
             if autoprueba { print("no pude grabar (¿permiso de micrófono?)"); exit(1) }
+            self.grabadora = nil
             aviso.mostrar("No pude grabar: revisa el permiso de micrófono", color: .systemOrange, segundos: 3)
             return
         }
@@ -700,48 +705,76 @@ final class Delegado: NSObject, NSApplicationDelegate, NSWindowDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
             if self?.grabando == true { self?.aviso.mostrarGrabando { [weak self] in self?.nivelDelMicrofono() ?? -160 } }
         }
+        // Tope de seguridad: si nunca llega el aviso de que soltaste, no se queda grabando.
+        let marca = inicioPulsacion
+        DispatchQueue.main.asyncAfter(deadline: .now() + 600) { [weak self] in
+            guard let self = self, self.grabando, self.inicioPulsacion == marca else { return }
+            anotar("tope de 10 minutos: se cierra la grabación")
+            self.terminar()
+        }
+    }
+
+    private func soltarGrabadora() {
+        grabadora?.stop()
+        grabadora = nil
+        try? FileManager.default.removeItem(atPath: rutaGrabacion)
     }
 
     private func cancelar() {
+        anotar("grabación descartada: se oprimió otra tecla")
         grabando = false
-        grabadora?.stop()
+        soltarGrabadora()
         aviso.ocultar()
         pintarIcono()
-        prepararGrabadora()
     }
 
     private func terminar() {
-        let duracion = grabadora?.currentTime ?? 0
+        // La duración se mide con el reloj, no con la grabadora: si el micrófono tarda en
+        // arrancar, una pulsación larga no debe confundirse con un toque.
+        let pulsacion = Date().timeIntervalSince(inicioPulsacion)
+        _ = nivelDelMicrofono()
+        let grabado = grabadora?.currentTime ?? 0
         grabando = false
         grabadora?.stop()
+        grabadora = nil
         pintarIcono()
 
-        if duracion < duracionMinima {
+        if pulsacion < duracionMinima {
             aviso.ocultar()
-            prepararGrabadora()
+            try? FileManager.default.removeItem(atPath: rutaGrabacion)
             let ahora = Date()
             if ahora.timeIntervalSince(ultimoToque) < ventanaDobleToque {
                 ultimoToque = .distantPast
                 anotar("doble toque: abrir corrección")
                 abrirCorreccion()
             } else {
-                anotar("toque de \(String(format: "%.2f", duracion)) s")
+                anotar("toque de \(String(format: "%.2f", pulsacion)) s")
                 ultimoToque = ahora
+                // Si no llega un segundo toque, recuerda cómo se usa: así se ve que la tecla sí responde.
+                DispatchQueue.main.asyncAfter(deadline: .now() + ventanaDobleToque) { [weak self] in
+                    guard let self = self, self.ultimoToque == ahora, !self.grabando, !self.transcribiendo else { return }
+                    self.aviso.mostrar("Mantén ⌘ derecho mientras hablas", segundos: 2.2)
+                }
             }
             return
         }
 
+        anotar(String(format: "pulsación de %.1f s, grabado %.1f s, volumen máximo %.0f dB", pulsacion, grabado, nivelMaximo))
+        if autoprueba { print(String(format: "pulsación %.2f s · grabado %.2f s · arranque del micrófono %.2f s", pulsacion, grabado, pulsacion - grabado)) }
         try? FileManager.default.removeItem(atPath: rutaUltimoAudio)
         do {
-            try FileManager.default.copyItem(atPath: rutaGrabacion, toPath: rutaUltimoAudio)
+            try FileManager.default.moveItem(atPath: rutaGrabacion, toPath: rutaUltimoAudio)
         } catch {
             anotar("no pude guardar el audio: \(error.localizedDescription)")
             aviso.mostrar("No pude guardar el audio", color: .systemOrange, segundos: 3)
-            prepararGrabadora()
             return
         }
-        prepararGrabadora()
-        transcribir(duracion: duracion)
+        if grabado < 0.15 {
+            anotar("el micrófono no alcanzó a grabar")
+            aviso.mostrar("El micrófono no alcanzó a grabar: inténtalo otra vez", color: .systemOrange, segundos: 3)
+            return
+        }
+        transcribir(duracion: grabado)
     }
 
     private func transcribir(duracion: Double) {
