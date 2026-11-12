@@ -13,7 +13,6 @@ DIR = os.environ.get("IRIZA_WHISPER_DIR") or os.path.expanduser("~/.config/iriza
 RUTA_CONFIG = os.path.join(DIR, "config.json")
 RUTA_REGLAS = os.path.join(DIR, "reglas.json")
 DIR_CORRECCIONES = os.path.join(DIR, "correcciones")
-RUTA_HISTORIAL = os.path.join(DIR, "historial.jsonl")
 
 CONFIG_BASE = {
     "whisper": "/opt/homebrew/bin/whisper-cli",

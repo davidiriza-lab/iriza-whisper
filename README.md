@@ -70,6 +70,14 @@ python3 ~/.config/iriza-whisper/bin/evaluar.py
 
 Vuelve a transcribir todas tus correcciones guardadas y dice cuántas saldrían bien hoy.
 
+## Qué ocupa y qué deja
+
+- **En reposo:** unos 14 MB de memoria y 0 % de procesador. El modelo de Whisper (1.6 GB) solo se carga durante los uno o dos segundos que dura cada transcripción y se suelta al terminar. No queda ningún proceso de fondo aparte de la app.
+- **Lo que dictas no se guarda.** No hay historial: el texto solo existe donde lo pegaste.
+- **Audio:** se conserva únicamente el último dictado (`ultimo.wav`, se sobrescribe con el siguiente y se borra al cerrar la app), porque hace falta si decides corregirlo.
+- **Lo que sí se acumula, porque tú lo pides:** cada corrección que guardas, con su audio, en `correcciones/`. Bórralas cuando quieras; solo pierdes el examen de `evaluar.py`.
+- **Bitácora:** `app.log` guarda horas y duraciones (nunca el texto) y se recorta sola a unas 200 líneas.
+
 ## Otro idioma u otro modelo
 
 Crea `~/.config/iriza-whisper/config.json` con lo que quieras cambiar:
@@ -86,7 +94,7 @@ Las llaves disponibles están en `CONFIG_BASE`, en `scripts/comun.py`. La revisi
 |---|---|---|
 | App (Swift, un archivo) | `app/main.swift` → `/Applications/Iriza Whisper.app` | Atajo global, grabación, cápsula, pegado y ventana de corrección |
 | Motor (Python, sin dependencias) | `scripts/` → `~/.config/iriza-whisper/bin/` | Llama a Whisper, aplica vocabulario y reglas, aprende de las correcciones |
-| Datos | `~/.config/iriza-whisper/` | `reglas.json`, `config.json` (opcional), `historial.jsonl`, `correcciones/`, `app.log` |
+| Datos | `~/.config/iriza-whisper/` | `reglas.json`, `config.json` (opcional), `correcciones/`, `ultimo.wav`, `app.log` |
 
 Para actualizar: `git pull && ./instalar.sh`. Si solo cambió el motor, `./instalar.sh --solo-scripts` no recompila. La app se firma con un requisito fijo para que macOS conserve los permisos entre versiones; si después de actualizar la tecla deja de responder, quita «Iriza Whisper» de la lista de Accesibilidad y vuelve a activarla.
 
@@ -108,14 +116,13 @@ B="/Applications/Iriza Whisper.app/Contents/MacOS/IrizaWhisper"
 - El primer cuarto de segundo tras oprimir ⌘ derecho puede no grabarse; empieza a hablar un instante después.
 - En las apps que no informan dónde está el cursor (VS Code, Chrome) pierdes lo que tenías copiado antes de dictar.
 - La tecla es ⌘ derecho y no se puede cambiar sin editar `app/main.swift`.
-- `historial.jsonl` guarda el texto de todo lo dictado, solo en tu Mac. Se puede borrar cuando quieras.
 
 ## Desinstalar
 
 ```bash
 pkill -x IrizaWhisper
 rm -rf "/Applications/Iriza Whisper.app" ~/Library/LaunchAgents/com.davidiriza.irizawhisper.plist
-rm -rf ~/.config/iriza-whisper   # borra también tu vocabulario, reglas e historial
+rm -rf ~/.config/iriza-whisper   # borra también tu vocabulario, tus reglas y tus correcciones
 ```
 
 ## Licencia

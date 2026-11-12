@@ -26,14 +26,8 @@ def main():
     config = comun.cargar_config()
     if texto and config.get("espacio_final"):
         texto += " "
+    # No se guarda ningún historial: lo dictado solo existe en la app de destino.
     resultado = {"crudo": crudo, "texto": texto, "segundos": round(time.time() - inicio, 2)}
-    if texto.strip():
-        try:
-            os.makedirs(comun.DIR, exist_ok=True)
-            with open(comun.RUTA_HISTORIAL, "a", encoding="utf-8") as f:
-                f.write(json.dumps({"cuando": time.strftime("%Y-%m-%d %H:%M:%S"), **resultado}, ensure_ascii=False) + "\n")
-        except OSError:
-            pass
     print(json.dumps(resultado, ensure_ascii=False))
     return 0
 

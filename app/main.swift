@@ -504,7 +504,23 @@ final class Delegado: NSObject, NSApplicationDelegate, NSWindowDelegate {
         RunLoop.main.run(until: Date().addingTimeInterval(0.6))
     }
 
+    /// La bitácora solo guarda horas y duraciones, y nunca pasa de unas 200 líneas.
+    private func recortarBitacora() {
+        guard let texto = try? String(contentsOfFile: rutaBitacora, encoding: .utf8) else { return }
+        let lineas = texto.split(separator: "\n", omittingEmptySubsequences: true)
+        guard lineas.count > 200 else { return }
+        try? (lineas.suffix(100).joined(separator: "\n") + "\n").write(toFile: rutaBitacora, atomically: true, encoding: .utf8)
+    }
+
+    /// Al cerrar no queda audio: se borran la última grabación y el archivo temporal.
+    func applicationWillTerminate(_ notification: Notification) {
+        grabadora?.stop()
+        try? FileManager.default.removeItem(atPath: rutaUltimoAudio)
+        try? FileManager.default.removeItem(atPath: rutaGrabacion)
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
+        recortarBitacora()
         anotar("arranque")
         if autoprueba {
             prepararGrabadora()
