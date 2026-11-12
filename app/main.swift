@@ -20,8 +20,9 @@ let python = "/usr/bin/python3"
 let teclaCmdDerecho: UInt16 = 54
 let mascaraCmdDerecho: UInt = 0x10  // NX_DEVICERCMDKEYMASK
 let mascaraCmdIzquierdo: UInt = 0x08  // NX_DEVICELCMDKEYMASK
-let duracionMinima = 0.35  // menos que esto es un toque, no un dictado
-let ventanaDobleToque = 0.6
+// Un toque natural dura entre 0.1 y 0.4 s. Con 0.35 y 0.6 el doble toque exigía demasiada prisa.
+let duracionMinima = 0.5  // menos que esto es un toque, no un dictado
+let ventanaDobleToque = 1.0  // tiempo máximo entre soltar el primer toque y soltar el segundo
 
 func anotar(_ texto: String) {
     let formato = DateFormatter()
@@ -547,6 +548,13 @@ final class Delegado: NSObject, NSApplicationDelegate, NSWindowDelegate {
             }
         }
         prepararGrabadora()
+        // Tras despertar del reposo o cambiar de micrófono, la grabadora preparada puede quedar inservible.
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            anotar("despertó del reposo: se prepara la grabadora de nuevo")
+            self?.prepararGrabadora()
+        }
     }
 
     // MARK: Menús
@@ -714,8 +722,10 @@ final class Delegado: NSObject, NSApplicationDelegate, NSWindowDelegate {
             let ahora = Date()
             if ahora.timeIntervalSince(ultimoToque) < ventanaDobleToque {
                 ultimoToque = .distantPast
+                anotar("doble toque: abrir corrección")
                 abrirCorreccion()
             } else {
+                anotar("toque de \(String(format: "%.2f", duracion)) s")
                 ultimoToque = ahora
             }
             return
@@ -759,6 +769,7 @@ final class Delegado: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 let crudo = respuesta["crudo"] as? String ?? ""
                 anotar("dictado de \(String(format: "%.1f", duracion)) s, transcrito en \(respuesta["segundos"] ?? "?") s")
                 if texto.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    anotar("sin texto: no se reconoció voz en la grabación")
                     self.aviso.mostrar("No escuché nada", segundos: 1.5)
                     return
                 }

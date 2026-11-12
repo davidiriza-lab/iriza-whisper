@@ -36,7 +36,7 @@ La primera vez macOS pide dos permisos: **Micrófono** (para grabar) y **Accesib
 | Gesto | Qué pasa |
 |---|---|
 | Mantener ⌘ derecho | Graba. Al soltar, transcribe y pega donde esté el cursor |
-| Doble toque de ⌘ derecho | Abre «Corregir lo último» |
+| Doble toque de ⌘ derecho | Abre «Corregir lo último». Cada toque dura menos de medio segundo y el segundo llega antes de un segundo |
 | ⌘ derecho + otra tecla | Nada: se trata como un atajo normal y la grabación se descarta |
 
 Mientras grabas aparece una cápsula con ondas que siguen tu voz y el tiempo transcurrido. El icono de micrófono en la barra de menús trae «Corregir lo último», «Copiar el último dictado», «Abrir vocabulario y reglas», «Pausar dictado» y «Salir».
