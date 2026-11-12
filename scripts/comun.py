@@ -125,7 +125,7 @@ def transcribir(ruta_audio, config=None, reglas=None):
     config = config or cargar_config()
     reglas = reglas or cargar_reglas()
     if not os.path.exists(config["whisper"]):
-        raise RuntimeError("no encuentro whisper-cli: instálalo con 'brew install whisper-cpp'")
+        raise RuntimeError("no encuentro whisper-cli: instálalo con 'brew install whisper.cpp'")
     if not os.path.exists(config["modelo"]):
         raise RuntimeError("falta el modelo de Whisper en " + config["modelo"] + ": corre ./instalar.sh")
     prompt = armar_prompt(reglas["vocabulario"])

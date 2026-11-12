@@ -32,7 +32,7 @@ revisar() {
 	if [ -x /opt/homebrew/bin/whisper-cli ] || [ -x /usr/local/bin/whisper-cli ] || command -v whisper-cli >/dev/null 2>&1; then
 		echo "OK     whisper-cli"
 	else
-		echo "FALTA  whisper-cli. Instálalo con:  brew install whisper-cpp"
+		echo "FALTA  whisper-cli. Instálalo con:  brew install whisper.cpp"
 		falta=1
 	fi
 	if [ -f "$MODELO" ]; then

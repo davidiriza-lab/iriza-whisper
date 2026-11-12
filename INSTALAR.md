@@ -20,7 +20,7 @@ Si la persona tiene una carpeta de proyectos, clónalo ahí en lugar de en su ca
 Imprime una línea por requisito, con `OK` o `FALTA`, y debajo de cada `FALTA` el comando exacto para instalarlo. Los requisitos son:
 
 - El compilador de Swift (`xcode-select --install`; abre una ventana del sistema que la persona debe aceptar).
-- `whisper-cli` (`brew install whisper-cpp`). Si no hay Homebrew, dile que lo instale desde https://brew.sh.
+- `whisper-cli` (`brew install whisper.cpp`). Si no hay Homebrew, dile que lo instale desde https://brew.sh.
 - El modelo de Whisper, 1.6 GB. Avísale el tamaño antes de bajarlo.
 - El detector de voz, menos de 1 MB.
 
