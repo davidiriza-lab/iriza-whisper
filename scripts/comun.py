@@ -7,11 +7,13 @@ import os
 import re
 import shutil
 import subprocess
+import time
 
 # IRIZA_WHISPER_DIR permite probar con una carpeta de datos aparte, sin tocar la real.
 DIR = os.environ.get("IRIZA_WHISPER_DIR") or os.path.expanduser("~/.config/iriza-whisper")
 RUTA_CONFIG = os.path.join(DIR, "config.json")
 RUTA_REGLAS = os.path.join(DIR, "reglas.json")
+RUTA_BITACORA = os.path.join(DIR, "app.log")
 DIR_CORRECCIONES = os.path.join(DIR, "correcciones")
 
 CONFIG_BASE = {
@@ -21,6 +23,9 @@ CONFIG_BASE = {
     "idioma": "es",
     "hilos": 4,
     "espacio_final": True,
+    # Margen que se deja alrededor de la voz detectada. Con el margen de fábrica (30 ms) un
+    # dictado de una o dos palabras llega tan recortado que Whisper inventa otra cosa.
+    "vad_margen_ms": 300,
 }
 
 # Whisper recibe el vocabulario como "texto previo". Solo le caben unas 220 fichas,
@@ -106,21 +111,53 @@ def aplicar_reemplazos(texto, reemplazos):
     return texto
 
 
-def limpiar_crudo(texto, prompt=""):
-    """Quita marcas de no-voz, el eco del vocabulario y las frases inventadas."""
+def quitar_marcas(texto, prompt=""):
+    """Quita marcas de no-voz y el eco del vocabulario."""
     texto = re.sub(r"\[[^\]]*\]|\([^)]*\)|\*[^*]*\*", " ", texto)  # [MÚSICA], (risas), *suspiro*
     texto = " ".join(texto.split())
     if prompt and texto.startswith(prompt):
         texto = texto[len(prompt):].strip()
     if texto.lower().startswith("vocabulario:"):
         return ""
-    if texto.lower().strip(" .!¡") in {i.strip(" .!¡") for i in INVENTOS}:
-        return ""
     return texto
 
 
+def es_invento(texto):
+    return texto.lower().strip(" .!¡") in {i.strip(" .!¡") for i in INVENTOS}
+
+
+def anotar(texto):
+    """Deja una línea en la bitácora de la app. Nunca lo dictado: solo qué pasó."""
+    try:
+        with open(RUTA_BITACORA, "a", encoding="utf-8") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M:%S") + " " + texto + "\n")
+    except OSError:
+        pass
+
+
+def correr_whisper(config, ruta_audio, prompt="", vad=False):
+    orden = [
+        config["whisper"], "-m", config["modelo"], "-l", config["idioma"],
+        "-t", str(config["hilos"]), "-nt", "-np", "-sns", "-f", ruta_audio,
+    ]
+    if prompt:
+        orden += ["--prompt", prompt, "--carry-initial-prompt"]
+    if vad:
+        orden += ["--vad", "-vm", config["modelo_vad"], "-vp", str(config.get("vad_margen_ms", 300))]
+    salida = subprocess.run(orden, capture_output=True, text=True, timeout=300)
+    if salida.returncode != 0:
+        raise RuntimeError("whisper-cli falló: " + salida.stderr.strip()[-400:])
+    return quitar_marcas(salida.stdout, prompt)
+
+
 def transcribir(ruta_audio, config=None, reglas=None):
-    """Devuelve (crudo, texto): lo que oyó Whisper y lo que queda tras las reglas."""
+    """Devuelve (crudo, texto): lo que oyó Whisper y lo que queda tras las reglas.
+
+    Un dictado de una o dos palabras es donde Whisper más falla: con el vocabulario delante
+    tiende a soltar una frase de relleno ("Gracias por ver el video") en vez de lo que oyó.
+    Por eso, cuando el detector sí oyó voz y Whisper contesta con relleno, se repite una vez
+    sin el vocabulario antes de darlo por perdido.
+    """
     config = config or cargar_config()
     reglas = reglas or cargar_reglas()
     if not os.path.exists(config["whisper"]):
@@ -128,17 +165,20 @@ def transcribir(ruta_audio, config=None, reglas=None):
     if not os.path.exists(config["modelo"]):
         raise RuntimeError("falta el modelo de Whisper en " + config["modelo"] + ": corre ./instalar.sh")
     prompt = armar_prompt(reglas["vocabulario"])
-    orden = [
-        config["whisper"], "-m", config["modelo"], "-l", config["idioma"],
-        "-t", str(config["hilos"]), "-nt", "-np", "-sns", "-f", ruta_audio,
-    ]
-    if prompt:
-        orden += ["--prompt", prompt, "--carry-initial-prompt"]
-    if config.get("modelo_vad") and os.path.exists(config["modelo_vad"]):
-        orden += ["--vad", "-vm", config["modelo_vad"]]
-    salida = subprocess.run(orden, capture_output=True, text=True, timeout=300)
-    if salida.returncode != 0:
-        raise RuntimeError("whisper-cli falló: " + salida.stderr.strip()[-400:])
-    crudo = limpiar_crudo(salida.stdout, prompt)
+    vad = bool(config.get("modelo_vad") and os.path.exists(config["modelo_vad"]))
+
+    crudo = correr_whisper(config, ruta_audio, prompt, vad)
+    if not vad:
+        # Sin detector de voz no hay forma de saber si hubo voz: el relleno siempre se descarta.
+        if es_invento(crudo):
+            crudo = ""
+    elif es_invento(crudo):
+        # El detector sí oyó voz y Whisper contestó con relleno: se repite sin el vocabulario.
+        segundo = correr_whisper(config, ruta_audio, "", True) if prompt else crudo
+        solo_gracias = segundo.lower().strip(" .!¡") == "gracias"
+        # "Gracias" a secas sí se dicta; las frases largas de relleno, nunca.
+        crudo = segundo if (segundo and (not es_invento(segundo) or solo_gracias)) else ""
+        if prompt:
+            anotar("segundo intento sin vocabulario: " + ("recuperado" if crudo else "nada"))
     texto = aplicar_reemplazos(crudo, reglas["reemplazos"])
     return crudo, texto

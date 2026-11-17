@@ -14,7 +14,8 @@ let dirScripts = dirConfig + "/bin"
 let rutaUltimoAudio = dirConfig + "/ultimo.wav"
 let rutaReglas = dirConfig + "/reglas.json"
 let rutaBitacora = dirConfig + "/app.log"
-let rutaGrabacion = NSTemporaryDirectory() + "iriza-whisper-actual.wav"
+let prefijoAudios = "iriza-whisper-\(ProcessInfo.processInfo.processIdentifier)-"
+let rutaGrabacion = NSTemporaryDirectory() + prefijoAudios + "actual.wav"
 let python = "/usr/bin/python3"
 
 let teclaCmdDerecho: UInt16 = 54
@@ -23,6 +24,8 @@ let mascaraCmdIzquierdo: UInt = 0x08  // NX_DEVICELCMDKEYMASK
 // Un toque natural dura entre 0.1 y 0.4 s. Con 0.35 y 0.6 el doble toque exigía demasiada prisa.
 let duracionMinima = 0.5  // menos que esto es un toque, no un dictado
 let ventanaDobleToque = 1.0  // tiempo máximo entre soltar el primer toque y soltar el segundo
+/// Sello que llevan las teclas que manda esta app (el ⌘V del pegado), para no confundirlas con las tuyas.
+let selloPropio: Int64 = 0x4952_5A57
 
 func anotar(_ texto: String) {
     let formato = DateFormatter()
@@ -370,9 +373,10 @@ final class Aviso {
     }
 
     func mostrarTranscribiendo() {
+        // Si ya estaba transcribiendo (otro dictado en fila), la onda sigue sin dar un salto.
+        if vista.modo != .transcribiendo || !panel.isVisible { vista.inicio = Date() }
         vista.modo = .transcribiendo
         vista.fuenteNivel = nil
-        vista.inicio = Date()
         vista.arrancar()
         presentar(anchoCapsula: 170, segundos: 0)
     }
@@ -478,8 +482,17 @@ final class Delegado: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private let aviso = Aviso()
     private var grabadora: AVAudioRecorder?
     private var grabando = false
-    private var transcribiendo = false
+    /// Dictados ya grabados que esperan su texto. Se transcriben de uno en uno y en orden,
+    /// así que puedes empezar el siguiente sin esperar a que salga el anterior.
+    private var pendientes = 0
+    private let filaDeTranscripcion = DispatchQueue(label: "com.davidiriza.irizawhisper.transcripcion", qos: .userInitiated)
+    private var numeroDeGrabacion = 0
     private var pausado = false
+    private var relojTecla: Timer?
+    private var teclaVistaAbajo = false
+    private var revisionesSinTecla = 0
+    private var ultimoPegado = Date.distantPast
+    private var turnoDeResultado = 0
     private var ultimoToque = Date.distantPast
     private var inicioPulsacion = Date()
     private var nivelMaximo: Float = -160
@@ -490,6 +503,8 @@ final class Delegado: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var editor: NSTextView?
     /// Autoprueba: graba 2 s sin tocar el teclado ni pegar nada, e imprime el resultado.
     var autoprueba = false
+    /// Con 2, la autoprueba graba un segundo dictado mientras el primero todavía se transcribe.
+    var vueltasDeAutoprueba = 1
     /// En la prueba de corrección: carpeta donde se guardan las imágenes; no se espera a nadie.
     private var carpetaPrueba: String?
 
@@ -519,7 +534,16 @@ final class Delegado: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         grabadora?.stop()
         try? FileManager.default.removeItem(atPath: rutaUltimoAudio)
-        try? FileManager.default.removeItem(atPath: rutaGrabacion)
+        borrarAudiosTemporales(prefijo: prefijoAudios)
+    }
+
+    /// Borra la grabación en curso y las que esperaban transcribirse.
+    private func borrarAudiosTemporales(prefijo: String) {
+        let carpeta = NSTemporaryDirectory()
+        for nombre in (try? FileManager.default.contentsOfDirectory(atPath: carpeta)) ?? []
+        where nombre.hasPrefix(prefijo) && nombre.hasSuffix(".wav") {
+            try? FileManager.default.removeItem(atPath: carpeta + nombre)
+        }
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -528,8 +552,17 @@ final class Delegado: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if autoprueba {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { self.empezar() }
             DispatchQueue.main.asyncAfter(deadline: .now() + 3.2) { self.terminar() }
+            if vueltasDeAutoprueba > 1 {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 3.3) {
+                    print("segundo dictado: empieza con \(self.pendientes) en fila")
+                    self.empezar()
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 5.5) { self.terminar() }
+            }
             return
         }
+        // Restos de una vez anterior que se cerró a la fuerza (un apagón, por ejemplo).
+        borrarAudiosTemporales(prefijo: "iriza-whisper-")
         armarMenuPrincipal()
         icono = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         pintarIcono()
@@ -539,14 +572,40 @@ final class Delegado: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if AXIsProcessTrustedWithOptions(opciones) {
             instalarMonitores()
         } else {
-            anotar("falta permiso de accesibilidad")
-            relojPermiso = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] reloj in
-                guard AXIsProcessTrusted() else { return }
-                reloj.invalidate()
-                anotar("permiso de accesibilidad concedido")
-                self?.instalarMonitores()
-                self?.aviso.mostrar("Listo: mantén ⌘ derecho para dictar", segundos: 3)
-            }
+            esperarPermiso()
+        }
+        let centro = NSWorkspace.shared.notificationCenter
+        centro.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.alVolver("la Mac despertó")
+        }
+        centro.addObserver(forName: NSWorkspace.sessionDidBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.alVolver("volviste a tu sesión")
+        }
+    }
+
+    private func esperarPermiso() {
+        anotar("falta permiso de accesibilidad")
+        relojPermiso?.invalidate()
+        relojPermiso = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] reloj in
+            guard AXIsProcessTrusted() else { return }
+            reloj.invalidate()
+            anotar("permiso de accesibilidad concedido")
+            self?.instalarMonitores()
+            self?.aviso.mostrar("Listo: mantén ⌘ derecho para dictar", segundos: 3)
+        }
+    }
+
+    /// Al despertar la Mac o volver a tu sesión se vuelve a poner el atajo. No cuesta nada y
+    /// evita que la tecla se quede sin respuesta si macOS soltó la escucha mientras dormía.
+    private func alVolver(_ motivo: String) {
+        recortarBitacora()
+        anotar(motivo)
+        if grabando { cancelar("la Mac entró en reposo") }
+        if AXIsProcessTrusted() {
+            instalarMonitores()
+        } else {
+            pintarIcono()
+            if relojPermiso?.isValid != true { esperarPermiso() }
         }
     }
 
@@ -573,7 +632,7 @@ final class Delegado: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let simbolo: String
         if !accesible { simbolo = "mic.slash" }
         else if grabando { simbolo = "mic.fill" }
-        else if transcribiendo { simbolo = "ellipsis.circle" }
+        else if pendientes > 0 { simbolo = "ellipsis.circle" }
         else if pausado { simbolo = "pause.circle" }
         else { simbolo = "mic" }
         let imagen = NSImage(systemSymbolName: simbolo, accessibilityDescription: "Iriza Whisper")
@@ -632,8 +691,11 @@ final class Delegado: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     private func alEvento(_ evento: NSEvent) {
         if evento.type == .keyDown {
+            guard grabando else { return }
+            // El ⌘V que esta app manda para pegar el dictado anterior no es una tecla tuya.
+            if esPropio(evento) { return }
             // ⌘ derecho + otra tecla es un atajo normal, no un dictado.
-            if grabando { cancelar() }
+            cancelar("se oprimió otra tecla")
             return
         }
         let banderas = evento.modifierFlags.rawValue
@@ -641,18 +703,81 @@ final class Delegado: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let otros = banderas & mascaraCmdIzquierdo != 0
             || !evento.modifierFlags.intersection([.shift, .control, .option]).isEmpty
         if evento.keyCode == teclaCmdDerecho {
-            if cmdDerecho, !otros, !pausado, !transcribiendo {
-                if grabando {
-                    // Se perdió el aviso de que soltaste la tecla la vez anterior.
-                    anotar("la grabación anterior quedó abierta: se reinicia")
-                    cancelar()
-                }
+            if cmdDerecho, !otros, !pausado {
+                // Si ya estaba grabando, se perdió el aviso de que soltaste la tecla la vez anterior.
+                if grabando { cancelar("la grabación anterior quedó abierta") }
                 empezar()
-            } else if !cmdDerecho, grabando {
+            } else if cmdDerecho {
+                // Queda anotado para que un "no respondió" siempre tenga explicación.
+                anotar("⌘ derecho sin efecto: " + (pausado ? "el dictado está en pausa" : "había otra tecla modificadora oprimida"))
+            } else if grabando {
                 terminar()
             }
         } else if grabando {
-            cancelar()
+            cancelar("se oprimió otra tecla modificadora")
+        }
+    }
+
+    private func esPropio(_ evento: NSEvent) -> Bool {
+        if evento.cgEvent?.getIntegerValueField(.eventSourceUserData) == selloPropio { return true }
+        // Por si el sello se pierde en el camino: una ⌘V justo después de pegar es la nuestra.
+        return evento.keyCode == 9 && evento.modifierFlags.contains(.command) && Date().timeIntervalSince(ultimoPegado) < 0.5
+    }
+
+    /// Mientras grabas, revisa cada cuarto de segundo si la tecla sigue oprimida de verdad.
+    /// macOS a veces no avisa que la soltaste, y la grabación se quedaba abierta sin que lo notaras.
+    private func vigilarTecla() {
+        relojTecla?.invalidate()
+        relojTecla = nil
+        revisionesSinTecla = 0
+        // Solo se confía en esta revisión si alcanzó a ver la tecla oprimida al menos una vez.
+        teclaVistaAbajo = teclaOprimida()
+        if autoprueba { return }
+        let nuevo = Timer(timeInterval: 0.25, repeats: true) { [weak self] _ in
+            guard let self = self, self.grabando else { return }
+            if self.teclaOprimida() {
+                self.teclaVistaAbajo = true
+                self.revisionesSinTecla = 0
+            } else if self.teclaVistaAbajo {
+                self.revisionesSinTecla += 1
+                if self.revisionesSinTecla >= 2 {
+                    anotar("no llegó el aviso de que soltaste la tecla: la grabación se cierra sola")
+                    self.terminar()
+                }
+            }
+        }
+        RunLoop.main.add(nuevo, forMode: .common)
+        relojTecla = nuevo
+    }
+
+    private func teclaOprimida() -> Bool {
+        CGEventSource.keyState(.hidSystemState, key: CGKeyCode(teclaCmdDerecho))
+    }
+
+    private func dejarDeVigilarTecla() {
+        relojTecla?.invalidate()
+        relojTecla = nil
+    }
+
+    /// Deja la cápsula como corresponde a lo que está pasando. Grabar manda sobre transcribir.
+    private func refrescarAviso() {
+        if grabando { return }
+        if pendientes > 0 { aviso.mostrarTranscribiendo() } else { aviso.ocultar() }
+    }
+
+    /// Mensaje sobre un dictado que ya terminó. Si estás grabando el siguiente, no lo tapa;
+    /// si hay otro en fila, al quitarse vuelve la onda de "transcribiendo".
+    private func avisarResultado(_ texto: String, color: NSColor = .white, segundos: Double) {
+        if grabando { return }
+        if pendientes == 0 {
+            aviso.mostrar(texto, color: color, segundos: segundos)
+            return
+        }
+        turnoDeResultado += 1
+        let miTurno = turnoDeResultado
+        aviso.mostrar(texto, color: color)
+        DispatchQueue.main.asyncAfter(deadline: .now() + segundos) { [weak self] in
+            if self?.turnoDeResultado == miTurno { self?.refrescarAviso() }
         }
     }
 
@@ -700,6 +825,8 @@ final class Delegado: NSObject, NSApplicationDelegate, NSWindowDelegate {
             return
         }
         grabando = true
+        turnoDeResultado += 1
+        vigilarTecla()
         pintarIcono()
         // El aviso espera un instante para no parpadear con un toque o un atajo.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
@@ -720,11 +847,12 @@ final class Delegado: NSObject, NSApplicationDelegate, NSWindowDelegate {
         try? FileManager.default.removeItem(atPath: rutaGrabacion)
     }
 
-    private func cancelar() {
-        anotar("grabación descartada: se oprimió otra tecla")
+    private func cancelar(_ motivo: String) {
+        anotar("grabación descartada: \(motivo)")
         grabando = false
+        dejarDeVigilarTecla()
         soltarGrabadora()
-        aviso.ocultar()
+        refrescarAviso()
         pintarIcono()
     }
 
@@ -735,12 +863,13 @@ final class Delegado: NSObject, NSApplicationDelegate, NSWindowDelegate {
         _ = nivelDelMicrofono()
         let grabado = grabadora?.currentTime ?? 0
         grabando = false
+        dejarDeVigilarTecla()
         grabadora?.stop()
         grabadora = nil
         pintarIcono()
 
         if pulsacion < duracionMinima {
-            aviso.ocultar()
+            refrescarAviso()
             try? FileManager.default.removeItem(atPath: rutaGrabacion)
             let ahora = Date()
             if ahora.timeIntervalSince(ultimoToque) < ventanaDobleToque {
@@ -752,50 +881,63 @@ final class Delegado: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 ultimoToque = ahora
                 // Si no llega un segundo toque, recuerda cómo se usa: así se ve que la tecla sí responde.
                 DispatchQueue.main.asyncAfter(deadline: .now() + ventanaDobleToque) { [weak self] in
-                    guard let self = self, self.ultimoToque == ahora, !self.grabando, !self.transcribiendo else { return }
+                    guard let self = self, self.ultimoToque == ahora, !self.grabando, self.pendientes == 0 else { return }
                     self.aviso.mostrar("Mantén ⌘ derecho mientras hablas", segundos: 2.2)
                 }
             }
             return
         }
 
-        anotar(String(format: "pulsación de %.1f s, grabado %.1f s, volumen máximo %.0f dB", pulsacion, grabado, nivelMaximo))
+        // El nombre del micrófono queda anotado: si un día graba silencio, se ve cuál estaba puesto.
+        let microfono = AVCaptureDevice.default(for: .audio)?.localizedName ?? "desconocido"
+        anotar(String(format: "pulsación de %.1f s, grabado %.1f s, volumen máximo %.0f dB, micrófono: ", pulsacion, grabado, nivelMaximo) + microfono)
         if autoprueba { print(String(format: "pulsación %.2f s · grabado %.2f s · arranque del micrófono %.2f s", pulsacion, grabado, pulsacion - grabado)) }
-        try? FileManager.default.removeItem(atPath: rutaUltimoAudio)
+        // Cada grabación va a su propio archivo: la anterior puede seguir transcribiéndose.
+        numeroDeGrabacion += 1
+        let audio = NSTemporaryDirectory() + prefijoAudios + "fila-\(numeroDeGrabacion).wav"
+        try? FileManager.default.removeItem(atPath: audio)
         do {
-            try FileManager.default.moveItem(atPath: rutaGrabacion, toPath: rutaUltimoAudio)
+            try FileManager.default.moveItem(atPath: rutaGrabacion, toPath: audio)
         } catch {
             anotar("no pude guardar el audio: \(error.localizedDescription)")
             aviso.mostrar("No pude guardar el audio", color: .systemOrange, segundos: 3)
             return
         }
         if grabado < 0.15 {
+            try? FileManager.default.removeItem(atPath: audio)
             anotar("el micrófono no alcanzó a grabar")
-            aviso.mostrar("El micrófono no alcanzó a grabar: inténtalo otra vez", color: .systemOrange, segundos: 3)
+            avisarResultado("El micrófono no alcanzó a grabar: inténtalo otra vez", color: .systemOrange, segundos: 3)
             return
         }
-        transcribir(duracion: grabado)
+        transcribir(audio: audio, duracion: grabado)
     }
 
-    private func transcribir(duracion: Double) {
-        transcribiendo = true
+    private func transcribir(audio: String, duracion: Double) {
+        pendientes += 1
+        if pendientes > 1 { anotar("en fila: \(pendientes) dictados esperan su texto") }
         pintarIcono()
-        aviso.mostrarTranscribiendo()
-        DispatchQueue.global(qos: .userInitiated).async {
-            let respuesta = correrScript("transcribir.py", [rutaUltimoAudio])
+        refrescarAviso()
+        filaDeTranscripcion.async {
+            let respuesta = correrScript("transcribir.py", [audio])
             DispatchQueue.main.async { [weak self] in
                 guard let self = self else { return }
-                self.transcribiendo = false
+                self.pendientes -= 1
+                // Este audio pasa a ser "el último", el que usa la corrección.
+                try? FileManager.default.removeItem(atPath: rutaUltimoAudio)
+                try? FileManager.default.moveItem(atPath: audio, toPath: rutaUltimoAudio)
                 if self.autoprueba {
                     let atributos = try? FileManager.default.attributesOfItem(atPath: rutaUltimoAudio)
                     print("grabación: \(String(format: "%.2f", duracion)) s, \(atributos?[.size] ?? 0) bytes")
                     print("respuesta: \(respuesta)")
-                    exit(respuesta["error"] == nil ? 0 : 1)
+                    self.vueltasDeAutoprueba -= 1
+                    if respuesta["error"] != nil { exit(1) }
+                    if self.vueltasDeAutoprueba <= 0 { exit(0) }
+                    return
                 }
                 self.pintarIcono()
                 if let error = respuesta["error"] as? String {
                     anotar("error al transcribir: \(error)")
-                    self.aviso.mostrar("Falló la transcripción (ver app.log)", color: .systemOrange, segundos: 4)
+                    self.avisarResultado("Falló la transcripción (ver app.log)", color: .systemOrange, segundos: 4)
                     return
                 }
                 let texto = respuesta["texto"] as? String ?? ""
@@ -803,7 +945,7 @@ final class Delegado: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 anotar("dictado de \(String(format: "%.1f", duracion)) s, transcrito en \(respuesta["segundos"] ?? "?") s")
                 if texto.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     anotar("sin texto: no se reconoció voz en la grabación")
-                    self.aviso.mostrar("No escuché nada", segundos: 1.5)
+                    self.avisarResultado("No escuché nada", segundos: 1.5)
                     return
                 }
                 self.ultimo = (crudo, texto)
@@ -839,8 +981,9 @@ final class Delegado: NSObject, NSApplicationDelegate, NSWindowDelegate {
         portapapeles.clearContents()
         portapapeles.setString(texto.trimmingCharacters(in: .whitespacesAndNewlines) + (destino == .sinCampo ? "" : " "), forType: .string)
 
+        let miCopia = portapapeles.changeCount
         if destino == .sinCampo {
-            aviso.mostrar("Copiado: pega con ⌘V donde lo necesites", segundos: 2.5)
+            avisarResultado("Copiado: pega con ⌘V donde lo necesites", segundos: 2.5)
             return
         }
         let fuente = CGEventSource(stateID: .combinedSessionState)
@@ -849,13 +992,19 @@ final class Delegado: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let arriba = CGEvent(keyboardEventSource: fuente, virtualKey: teclaV, keyDown: false)
         abajo?.flags = .maskCommand
         arriba?.flags = .maskCommand
+        // Sellada como propia: si ya estás grabando el siguiente dictado, esta ⌘V no debe cortarlo.
+        abajo?.setIntegerValueField(.eventSourceUserData, value: selloPropio)
+        arriba?.setIntegerValueField(.eventSourceUserData, value: selloPropio)
+        ultimoPegado = Date()
         abajo?.post(tap: .cghidEventTap)
         arriba?.post(tap: .cghidEventTap)
-        aviso.ocultar()
+        refrescarAviso()
 
         guard destino == .campoDeTexto else { return }
         // Devuelve lo que tenías copiado, cuando la app de destino ya leyó el texto.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+            // Si mientras tanto se copió otra cosa (tú, o el siguiente dictado), no se pisa.
+            guard portapapeles.changeCount == miCopia else { return }
             portapapeles.clearContents()
             if !respaldo.isEmpty { portapapeles.writeObjects(respaldo) }
         }
@@ -1082,6 +1231,38 @@ if argumentos.count >= 2, argumentos[1] == "--prueba-aviso" {
     exit(fallas == 0 ? 0 : 1)
 }
 
+if argumentos.count >= 2, argumentos[1] == "--prueba-sello" {
+    // Comprueba que la app reconoce como propias las teclas que ella misma manda (necesita el
+    // permiso de Accesibilidad). Manda F20, que no hace nada en ninguna app.
+    let appPrueba = NSApplication.shared
+    appPrueba.setActivationPolicy(.accessory)
+    var visto: Int64?
+    var cualquiera = 0
+    let monitor = NSEvent.addGlobalMonitorForEvents(matching: [.keyDown, .keyUp, .flagsChanged]) { evento in
+        cualquiera += 1
+        if evento.keyCode == 90 { visto = evento.cgEvent?.getIntegerValueField(.eventSourceUserData) ?? -1 }
+    }
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+        let fuente = CGEventSource(stateID: .combinedSessionState)
+        for abajo in [true, false] {
+            let tecla = CGEvent(keyboardEventSource: fuente, virtualKey: 90, keyDown: abajo)
+            tecla?.setIntegerValueField(.eventSourceUserData, value: selloPropio)
+            tecla?.post(tap: .cghidEventTap)
+        }
+    }
+    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+        if let monitor = monitor { NSEvent.removeMonitor(monitor) }
+        print("accesibilidad: \(AXIsProcessTrusted()) · escucha puesta: \(monitor != nil) · teclas vistas: \(cualquiera)")
+        if let visto = visto {
+            print(visto == selloPropio ? "BIEN sello reconocido" : "MAL  la tecla llegó sin sello (\(visto))")
+        } else {
+            print("MAL  la tecla de prueba no llegó")
+        }
+        exit(visto == selloPropio ? 0 : 1)
+    }
+    appPrueba.run()
+}
+
 if argumentos.count >= 3, argumentos[1] == "--fotos" {
     // Guarda imágenes de la cápsula en la carpeta dada: IrizaWhisper --fotos carpeta
     _ = NSApplication.shared
@@ -1091,13 +1272,14 @@ if argumentos.count >= 3, argumentos[1] == "--fotos" {
 
 let yoMismo = NSRunningApplication.current
 let gemelas = NSRunningApplication.runningApplications(withBundleIdentifier: Bundle.main.bundleIdentifier ?? "com.davidiriza.irizawhisper")
-if !argumentos.contains("--autoprueba"), gemelas.contains(where: { $0.processIdentifier != yoMismo.processIdentifier }) {
+if !argumentos.contains("--autoprueba"), !argumentos.contains("--autoprueba-doble"), gemelas.contains(where: { $0.processIdentifier != yoMismo.processIdentifier }) {
     exit(0)  // ya hay una corriendo
 }
 
 let app = NSApplication.shared
 let delegado = Delegado()
-delegado.autoprueba = argumentos.contains("--autoprueba")
+delegado.autoprueba = argumentos.contains("--autoprueba") || argumentos.contains("--autoprueba-doble")
+if argumentos.contains("--autoprueba-doble") { delegado.vueltasDeAutoprueba = 2 }
 app.delegate = delegado
 app.setActivationPolicy(.accessory)
 app.run()
